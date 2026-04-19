@@ -87,4 +87,4 @@ def create_sigmf_dataset(output_dir="./sigmf_dataset", num_samples=1000000):
     print(f"  Chirp interval: {chirp_interval*1000} ms")
 
 if __name__ == "__main__":
-    create_sigmf_dataset(num_samples=1_000_000_000)
+    create_sigmf_dataset(num_samples=500_000_000)
