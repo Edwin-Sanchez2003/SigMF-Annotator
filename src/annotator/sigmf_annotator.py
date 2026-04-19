@@ -322,7 +322,87 @@ class SpectralVarianceDetector(BaseDetector):
 
 # ─── Registry: all BaseDetector subclasses are auto-collected ────────────────
 def get_all_detectors() -> list[type[BaseDetector]]:
-    return BaseDetector.__subclasses__()
+    """
+    Return every loaded BaseDetector subclass.
+    Call load_detectors_from_dir() first to pull in external files.
+    """
+    def _recurse(cls):
+        result = []
+        for sub in cls.__subclasses__():
+            result.append(sub)
+            result.extend(_recurse(sub))   # support sub-subclasses
+        return result
+    return _recurse(BaseDetector)
+
+
+def load_detectors_from_dir(directory: str | Path) -> list[str]:
+    """
+    Import every .py file in `directory` so their BaseDetector subclasses
+    register themselves via inheritance.  Returns a list of loaded module names.
+
+    Drop a detector file in the 'detectors/' folder next to sigmf_annotator.py.
+    In your detector file, import from the installed package, e.g.:
+        from annotator.sigmf_annotator import BaseDetector, ...
+    or if running as a script directly:
+        from __main__ import BaseDetector, ...
+    """
+    import importlib.util
+
+    directory = Path(directory).resolve()
+    if not directory.is_dir():
+        return []
+
+    # Ensure the src/ layout roots are on sys.path so detectors can import
+    # the host package regardless of how the script was launched.
+    _ensure_importable()
+
+    loaded = []
+    for py_file in sorted(directory.glob("*.py")):
+        if py_file.stem.startswith("_"):
+            continue
+        mod_name = f"_sigmf_detector_{py_file.stem}"
+        try:
+            spec = importlib.util.spec_from_file_location(mod_name, py_file)
+            mod  = importlib.util.module_from_spec(spec)
+            sys.modules[mod_name] = mod
+            spec.loader.exec_module(mod)
+            loaded.append(py_file.name)
+        except Exception as e:
+            print(f"[detector loader] Could not load {py_file.name}: {e}")
+    return loaded
+
+
+def _ensure_importable():
+    """
+    Walk upward from this file looking for 'src/' layout roots and plain
+    package roots, adding them to sys.path so detector files can resolve
+    imports like 'from annotator.sigmf_annotator import ...'
+
+    Also re-registers the currently running module under its proper dotted
+    package name so that detectors importing from 'annotator.sigmf_annotator'
+    get the *same* module object as __main__, making BaseDetector.__subclasses__
+    pick them up correctly.
+    """
+    here = Path(__file__).resolve().parent   # .../src/annotator
+
+    candidates = [
+        here.parent,        # .../src        → enables 'annotator.*'
+        here.parent.parent, # project root   → enables 'src.annotator.*'
+        here,               # annotator dir  → fallback
+    ]
+    for p in candidates:
+        s = str(p)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+
+    # Re-register __main__ under its package path so subclasses of BaseDetector
+    # defined in external files (which import from 'annotator.sigmf_annotator')
+    # share the same class objects as __main__.
+    main_mod = sys.modules.get("__main__")
+    if main_mod is not None:
+        pkg_name = "annotator.sigmf_annotator"
+        if pkg_name not in sys.modules:
+            sys.modules[pkg_name] = main_mod
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1087,23 +1167,74 @@ class WaterfallCanvas(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DetectorWorker(QObject):
-    progress   = pyqtSignal(int)          # 0-100
-    finished   = pyqtSignal(list)         # list[DetectionResult]
-    error      = pyqtSignal(str)
+    progress = pyqtSignal(int)           # 0–100
+    finished = pyqtSignal(list)          # list[DetectionResult]
+    error    = pyqtSignal(str)
 
-    def __init__(self, detector_cls: type[BaseDetector], ctx: DetectionContext,
-                 kwargs: dict):
+    # Number of samples per chunk when running on the whole file.
+    # 4M complex64 samples ≈ 32 MB — tune to taste.
+    CHUNK_SAMPLES = 4_000_000
+
+    def __init__(self, detector_cls: type[BaseDetector],
+                 dataset: SigMFDataset,
+                 sample_start: int, sample_count: int,
+                 fft_size: int, kwargs: dict):
         super().__init__()
-        self.det_cls = detector_cls
-        self.ctx     = ctx
-        self.kwargs  = kwargs
+        self.det_cls      = detector_cls
+        self.dataset      = dataset
+        self.sample_start = sample_start
+        self.sample_count = sample_count
+        self.fft_size     = fft_size
+        self.kwargs       = kwargs
+        self._abort       = False
+
+    def abort(self):
+        self._abort = True
 
     def run(self):
         try:
-            det     = self.det_cls()
-            results = det.run(self.ctx, **self.kwargs)
-            self.progress.emit(100)
-            self.finished.emit(results)
+            det      = self.det_cls()
+            fs       = self.fft_size
+            sr       = self.dataset.sample_rate
+            cf       = self.dataset.center_freq
+            meta     = self.dataset.meta
+
+            # Align chunk size to a whole number of FFT windows
+            chunk_sz = max(fs, (self.CHUNK_SAMPLES // fs) * fs)
+
+            total    = self.sample_count
+            done     = 0
+            results: list[DetectionResult] = []
+
+            pos = self.sample_start
+            end = self.sample_start + total
+
+            while pos < end and not self._abort:
+                count   = min(chunk_sz, end - pos)
+                samples = self.dataset.read_samples(pos, count)
+                if samples.size == 0:
+                    break
+
+                ctx = DetectionContext(
+                    samples      = samples,
+                    sample_rate  = sr,
+                    center_freq  = cf,
+                    sample_start = pos,
+                    fft_size     = fs,
+                    sigmf_meta   = meta,
+                )
+                chunk_results = det.run(ctx, **self.kwargs)
+                results.extend(chunk_results)
+
+                done += len(samples)
+                pct   = min(99, int(done / total * 100))
+                self.progress.emit(pct)
+                pos  += len(samples)
+
+            if not self._abort:
+                self.progress.emit(100)
+                self.finished.emit(results)
+
         except Exception as e:
             self.error.emit(str(e))
 
@@ -1156,11 +1287,18 @@ class DetectorPanel(QWidget):
         btn_all.clicked.connect(self._emit_all)
         root.addWidget(btn_all)
 
-        # Progress
+        # Progress + abort
+        prog_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0,100); self.progress_bar.setValue(0)
+        self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
-        root.addWidget(self.progress_bar)
+        prog_row.addWidget(self.progress_bar)
+        self.btn_abort = QPushButton("✕")
+        self.btn_abort.setFixedWidth(28)
+        self.btn_abort.setToolTip("Abort running detector")
+        self.btn_abort.setVisible(False)
+        prog_row.addWidget(self.btn_abort)
+        root.addLayout(prog_row)
 
         self.status_lbl = QLabel("")
         self.status_lbl.setWordWrap(True)
@@ -1232,9 +1370,15 @@ class DetectorPanel(QWidget):
         if self._current_cls:
             self.run_all.emit(self._current_cls, self._collect_kwargs())
 
-    def set_running(self, running: bool):
+    def set_running(self, running: bool, abort_cb=None):
         self.progress_bar.setVisible(running)
-        if running: self.progress_bar.setValue(0)
+        self.btn_abort.setVisible(running)
+        if running:
+            self.progress_bar.setValue(0)
+            if abort_cb:
+                try: self.btn_abort.clicked.disconnect()
+                except: pass
+                self.btn_abort.clicked.connect(abort_cb)
 
     def set_progress(self, v: int):
         self.progress_bar.setValue(v)
@@ -1416,18 +1560,10 @@ class MainWindow(QMainWindow):
     def _launch_detector(self, cls: type[BaseDetector], kwargs: dict,
                          ss: int, sc: int):
         if self._det_thread and self._det_thread.isRunning():
-            QMessageBox.information(self,"Busy","A detector is already running.")
+            QMessageBox.information(self, "Busy", "A detector is already running.")
             return
-        samples = self.dataset.read_samples(ss, sc)
-        ctx = DetectionContext(
-            samples      = samples,
-            sample_rate  = self.dataset.sample_rate,
-            center_freq  = self.dataset.center_freq,
-            sample_start = ss,
-            fft_size     = self.canvas.fft_size,
-            sigmf_meta   = self.dataset.meta,
-        )
-        self._det_worker = DetectorWorker(cls, ctx, kwargs)
+        self._det_worker = DetectorWorker(
+            cls, self.dataset, ss, sc, self.canvas.fft_size, kwargs)
         self._det_thread = QThread()
         self._det_worker.moveToThread(self._det_thread)
         self._det_thread.started.connect(self._det_worker.run)
@@ -1436,9 +1572,14 @@ class MainWindow(QMainWindow):
         self._det_worker.error.connect(self._on_detection_error)
         self._det_worker.finished.connect(self._det_thread.quit)
         self._det_worker.error.connect(self._det_thread.quit)
-        self.det_panel.set_running(True)
+        self.det_panel.set_running(True, abort_cb=self._abort_detector)
         self.det_panel.set_status("Running…")
         self._det_thread.start()
+
+    def _abort_detector(self):
+        if self._det_worker:
+            self._det_worker.abort()
+            self.det_panel.set_status("Aborted.")
 
     def _on_detection_done(self, results: list):
         self.det_panel.set_running(False)
@@ -1543,6 +1684,12 @@ class MainWindow(QMainWindow):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
+    # Auto-load any detectors sitting in a 'detectors/' folder next to this script
+    _script_dir = Path(__file__).parent
+    _loaded = load_detectors_from_dir(_script_dir / "detectors")
+    if _loaded:
+        print(f"[detectors] Loaded: {', '.join(_loaded)}")
+
     app=QApplication(sys.argv); app.setStyle("Fusion")
     pal=QPalette()
     pal.setColor(QPalette.ColorRole.Window,        QColor(35,35,45))
