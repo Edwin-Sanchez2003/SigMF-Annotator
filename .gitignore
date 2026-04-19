@@ -45,4 +45,7 @@ Thumbs.db
 .env.*
 
 # Python version file (pyenv)
-.sigmf_waterfall_annotator
+.sigmf_waterfall_annotato
+
+# SigMF Datasets
+sigmf_dataset/
