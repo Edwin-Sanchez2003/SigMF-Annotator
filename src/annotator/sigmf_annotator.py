@@ -9,6 +9,7 @@ Layout:
 """
 
 import sys
+import re
 import json
 import math
 import numpy as np
@@ -66,6 +67,36 @@ for _n in ["Viridis","Inferno","Plasma","Jet","Greys"]:
 # SigMF loader
 # ─────────────────────────────────────────────────────────────────────────────
 class SigMFDataset:
+    """
+    Supports all valid SigMF datatypes.  Everything is converted to complex64
+    at read-time so the rest of the pipeline is unchanged.
+
+    SigMF datatype string grammar:
+        [r|c][u|i|f][8|16|32|64][_le|_be]
+        r = real, c = complex
+        u = unsigned int, i = signed int, f = float
+        8/16/32/64 = bits per component
+        endian suffix is optional (8-bit types have no endian)
+
+    Examples: cf32_le  ri16_le  cu8  rf64_be  ci32_be
+    """
+
+    # Map (is_float, bits) → native numpy scalar type (little-endian baseline)
+    _SCALAR: dict[tuple[bool, bool, int], str] = {
+        # (is_unsigned, is_float, bits) → numpy kind+width
+        (True,  False,  8): "u1",
+        (False, False,  8): "i1",
+        (True,  False, 16): "u2",
+        (False, False, 16): "i2",
+        (True,  False, 32): "u4",
+        (False, False, 32): "i4",
+        (True,  False, 64): "u8",
+        (False, False, 64): "i8",
+        (False, True,  32): "f4",
+        (False, True,  64): "f8",
+        # 8-bit floats not in SigMF spec; 16-bit float not standard either
+    }
+
     def __init__(self, meta_path: str):
         self.meta_path = Path(meta_path)
         self.data_path = self.meta_path.with_suffix(".sigmf-data")
@@ -75,26 +106,111 @@ class SigMFDataset:
             raise FileNotFoundError(f"Data not found: {self.data_path}")
         with open(self.meta_path) as f:
             self.meta = json.load(f)
-        g = self.meta.get("global", {})
-        dt = g.get("core:datatype", "")
-        if "cf32" not in dt and "complex64" not in dt:
-            raise ValueError(f"Only complex64 (cf32) supported. Got: '{dt}'")
+        g    = self.meta.get("global", {})
+        dt   = g.get("core:datatype", "").lower().strip()
         caps = self.meta.get("captures", [{}])
-        self.sample_rate  = float(g.get("core:sample_rate", 1.0))
-        self.center_freq  = float(caps[0].get("core:frequency",
-                                  g.get("core:frequency", 0.0)))
-        self.total_samples = self.data_path.stat().st_size // 8
-        self.annotations   = list(self.meta.get("annotations", []))
 
+        self.sample_rate = float(g.get("core:sample_rate", 1.0))
+        self.center_freq = float(caps[0].get("core:frequency",
+                                  g.get("core:frequency", 0.0)))
+        self.annotations = list(self.meta.get("annotations", []))
+
+        # ── parse datatype string ──────────────────────────────────────────
+        self._is_complex, self._numpy_dtype, self._bytes_per_sample = \
+            self._parse_datatype(dt)
+        self.total_samples = (self.data_path.stat().st_size
+                              // self._bytes_per_sample)
+
+    # ── datatype parsing ──────────────────────────────────────────────────────
+    @classmethod
+    def _parse_datatype(cls, dt: str) -> tuple[bool, np.dtype, int]:
+        """
+        Returns (is_complex, numpy_dtype_for_one_component, bytes_per_sample).
+        bytes_per_sample accounts for 2 components when complex.
+        """
+        m = re.fullmatch(
+            r'(c|r)(f|i|u)(\d+)(?:_(le|be))?', dt.replace("complex64","cf32_le")
+                                                    .replace("complex128","cf64_le"))
+        if not m:
+            raise ValueError(
+                f"Unrecognised SigMF datatype: '{dt}'\n"
+                f"Expected format: [c|r][f|i|u][8|16|32|64][_le|_be]")
+
+        kind_cr, kind_fiu, bits_str, endian = m.groups()
+        bits   = int(bits_str)
+        is_complex  = (kind_cr == "c")
+        is_float    = (kind_fiu == "f")
+        is_unsigned = (kind_fiu == "u")
+
+        key = (is_unsigned, is_float, bits)
+        if key not in cls._SCALAR:
+            raise ValueError(f"Unsupported component type: {kind_fiu}{bits}")
+
+        base_dt = np.dtype(cls._SCALAR[key])
+
+        # Apply endianness (8-bit types are always native, no swap needed)
+        if bits > 8:
+            if endian == "be":
+                base_dt = base_dt.newbyteorder('>')
+            else:
+                base_dt = base_dt.newbyteorder('<')   # le or absent → LE
+
+        n_components      = 2 if is_complex else 1
+        bytes_per_sample  = (bits // 8) * n_components
+        return is_complex, base_dt, bytes_per_sample
+
+    # ── I/O + conversion ──────────────────────────────────────────────────────
     def read_samples(self, start: int, count: int) -> np.ndarray:
+        """Read `count` samples starting at `start`, return as complex64."""
         start = max(0, min(start, self.total_samples - 1))
         count = min(count, self.total_samples - start)
         if count <= 0:
             return np.array([], dtype=np.complex64)
+
+        bps = self._bytes_per_sample
         with open(self.data_path, "rb") as f:
-            f.seek(start * 8)
-            raw = f.read(count * 8)
-        return np.frombuffer(raw, dtype=np.complex64)
+            f.seek(start * bps)
+            raw = f.read(count * bps)
+
+        dt  = self._numpy_dtype
+        arr = np.frombuffer(raw, dtype=dt)
+
+        # Byteswap big-endian in-place (frombuffer returns read-only view)
+        if dt.byteorder == '>' or (dt.byteorder == '=' and
+                                    np.dtype(dt.kind + str(dt.itemsize)).str[0] == '>'):
+            arr = arr.byteswap().newbyteorder()
+
+        return self._to_complex64(arr)
+
+    def _to_complex64(self, arr: np.ndarray) -> np.ndarray:
+        """Convert a flat component array to complex64."""
+        dt = self._numpy_dtype
+        is_float    = dt.kind == 'f'
+        is_unsigned = dt.kind == 'u'
+        bits        = dt.itemsize * 8
+
+        if self._is_complex:
+            # Interleaved I/Q pairs → complex
+            if arr.size % 2 != 0:
+                arr = arr[:-(arr.size % 2)]   # trim stray byte
+            iq = arr.reshape(-1, 2).astype(np.float32)
+        else:
+            # Real-only: treat as pure-real complex (imaginary = 0)
+            iq = np.stack([arr.astype(np.float32),
+                            np.zeros(len(arr), dtype=np.float32)], axis=1)
+
+        # Normalise integer types to [-1, 1]
+        if not is_float:
+            if is_unsigned:
+                # unsigned: [0, 2^N-1] → [-1, 1]  (subtract midpoint first)
+                mid = float(1 << (bits - 1))
+                iq  = (iq - mid) / mid
+            else:
+                # signed: [-2^(N-1), 2^(N-1)-1] → [-1, 1]
+                scale = float(1 << (bits - 1))
+                iq    = iq / scale
+
+        return (iq[:, 0] + 1j * iq[:, 1]).astype(np.complex64)
 
     def save(self):
         self.meta["annotations"] = self.annotations
