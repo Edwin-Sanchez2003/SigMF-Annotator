@@ -4,5 +4,3 @@ A simple SigMF Annotation tool, which visualizes SigMF datasets. This tool opens
 ## Setup
 *TODO*
 
-## Limitations
-* Only works with `cf32_le` files currently.
