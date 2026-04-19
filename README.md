@@ -139,6 +139,8 @@ All params support an optional `tooltip` string shown on hover.
 ## Building a Portable Windows Executable
 Run the following steps to convert your current version of the tool to a Windows executable, which can be run on any Windows device with no extra installation steps.
 
+> Bundling to a Windows executable must be done from a Windows device.
+
 ```bash
 pip install pyinstaller
 pip install -e .
