@@ -133,3 +133,14 @@ class MyDetector(BaseDetector):
 | `"choice"` | `QComboBox` | `choices` (list of strings) |
 
 All params support an optional `tooltip` string shown on hover.
+
+---
+
+## Building a Portable Windows Executable
+Run the following steps to convert your current version of the tool to a Windows executable, which can be run on any Windows device with no extra installation steps.
+
+```bash
+pip install pyinstaller
+pip install -e .
+build_windows.bat
+```
